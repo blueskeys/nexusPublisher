@@ -58,6 +58,7 @@ MSG_OK = "OK"
 MSG_FAIL = "FAIL"
 
 itemSize = 0
+passedSize = 0
 startTime = 0
 endTime = 0
 '''
@@ -95,6 +96,14 @@ def filterFirstLevelChildNodes(node,nodeName):
             if nodeName == "" or nodeName == child.nodeName:
                 list.append(child)
     return list
+'''
+根据标签查找节点
+'''
+def searchNodes(node, tagName):
+    list = []
+    if node == None:
+        return list
+    return node.getElementsByTagName(tagName)
     
 def getValue(element):
     return element == None and "" or element.firstChild.nodeValue
@@ -217,15 +226,25 @@ def handlePOM(dir,name):
     else:
         if parent != None:
             groupId = getValue(filterFirstLevelChildNodes(parent,"groupId")[0])
-
-    publishMvn(dir,name,artifactId,version,groupId)
+    ## classifier
+    profilesLen = len(filterFirstLevelChildNodes(project,"profiles"))
+    
+    if profilesLen > 0:
+        classifiers = searchNodes(project, "classifier")
+        for classifier in classifiers:
+            publishMvn(dir,name,artifactId,version,groupId, getValue(classifier))
+        return
+    publishMvn(dir,name,artifactId,version,groupId, None)
 '''
 验证jar是否存在
     存在返回路径
     不存在返回None
 '''
-def getPublishJar(path,filename):
-    jarPath = os.path.join(path,filename.replace(".pom",".jar"))
+def getPublishJar(path,filename, classifier):
+    prefix = ".jar"
+    if classifier != None:
+        prefix = "-" + classifier + prefix
+    jarPath = os.path.join(path,filename.replace(".pom", prefix))
     
     if os.path.exists(jarPath):
         return jarPath
@@ -234,7 +253,7 @@ def getPublishJar(path,filename):
 '''
 发布
 '''
-def publishMvn(path,filename,artifactId,version,groupId):
+def publishMvn(path,filename,artifactId,version,groupId, classifier):
     msg = MSG_OK
     if artifactId == "" or groupId == "" or version == "":
         msg = MSG_FAIL
@@ -246,10 +265,12 @@ def publishMvn(path,filename,artifactId,version,groupId):
     ################
     # 先提交jar
     ################
-    jarPath = getPublishJar(path,filename)
+    jarPath = getPublishJar(path,filename, classifier)
     if jarPath != None:
         # 发布jar
         mvnJarStr = mvnStr % (groupId,artifactId,version,"jar",getConfig("repositoryId"),jarPath,getConfig("url"),getConfig("generatePom"))
+        if classifier != None:
+            mvnJarStr += " -Dclassifier=" + classifier
         msg = mvnResultCheck(os.popen(mvnJarStr).readlines())
         logger.info("%s\t%s\t%s\t%s\t%s\t%s" % (artifactId,version,groupId,jarPath,msg,mvnJarStr))
     ################
@@ -265,8 +286,10 @@ def dirSearch(dir):
     os.path.walk(dir,visit,[])
     global itemSize
     itemSize = len(q.queue)
-    threadSize = min(itemSize, 10)
-    logger.info("待发布依赖数量为【%s】" % itemSize)
+    conMaxThread = getConfig("maxThread")
+    threadSize = min(itemSize, conMaxThread)
+
+    logger.info("待发布依赖数量为【%s】,启动线程个数为【%s】" % (itemSize, threadSize))
     for i in range(threadSize):
         # threadName = "Thread-%s" % i
         myThread(i).start()
@@ -282,16 +305,19 @@ class myThread(threading.Thread):
             try:
                 threadLock.acquire()
                 item = q.get()
-                passedSize = itemSize - len(q.queue)
-                per = 0
-                if itemSize != 0:
-                    per = passedSize / itemSize * 100
-                doPrint("当前进度[%s / %s] %.2f%%" % (passedSize, itemSize, per))
+                
                 threadLock.release()
                 if repositoryType == 'maven':
                     handlePOM(item[0], item[1])
                 elif repositoryType == 'npm':
                     handleNPM(item[0])
+                global passedSize
+                passedSize+=1
+                #passedSize = itemSize - len(q.queue)
+                per = 0
+                if itemSize != 0:
+                    per = passedSize / itemSize * 100
+                doPrint("当前进度[%s / %s] %.2f%%" % (passedSize, itemSize, per))
             except Exception as e:
                 print e
         recordDone()
@@ -330,6 +356,7 @@ def writeConfig():
     cf.set("maven","url","Your maven repository Url,like http://xxx/maven2/repository")
     cf.set("maven","repositoryId","Your maven repositoryId,must match with maven pom.xml")
     cf.set("maven","generatePom","false")
+    cf.set("maven","maxThread", 10)
     cf.add_section("npm")
     cf.set("npm","url","Your npm repository Url,like http://xxx/npm/repository")
     with open(CONFIG_FILE_NAME,"w+") as f:
@@ -345,6 +372,12 @@ def readConfig():
         return readMavenConfig()
     elif repositoryType == 'npm':
         return readNpmConfig()
+        
+def safeReadConfig(config, item, option):
+    try:
+        return config.get(item, option)
+    except Exception as e:
+        return ''
 '''
 读取maven配置
 '''
@@ -352,13 +385,14 @@ def readMavenConfig():
     config = ConfigParser.ConfigParser();
     config.read(CONFIG_FILE_NAME)
 
-    confUrl = config.get("maven","url") or ""
+    confUrl = safeReadConfig(config, "maven","url")
     if confUrl.startswith("Your"):
         doPrint("请填写配置文件，路径为：当前目录/%s" % CONFIG_FILE_NAME)
         sys.exit()
     conf[repositoryType]["url"] = confUrl
-    conf[repositoryType]["repositoryId"] = config.get("maven", "repositoryId") or ""
-    conf[repositoryType]["generatePom"] = config.get("maven", "generatePom") or ""
+    conf[repositoryType]["repositoryId"] = safeReadConfig(config, "maven", "repositoryId")
+    conf[repositoryType]["generatePom"] = safeReadConfig(config, "maven", "generatePom")
+    conf[repositoryType]["maxThread"] = int(safeReadConfig(config, "maven", "maxThread") or "10")
     return True
 '''
 读取npm配置
@@ -367,12 +401,14 @@ def readNpmConfig():
     config = ConfigParser.ConfigParser();
     config.read(CONFIG_FILE_NAME)
 
-    confUrl = config.get("npm","url") or ""
+    confUrl = safeReadConfig(config, "npm","url")
     if confUrl.startswith("Your"):
         doPrint("请填写配置文件，路径为：当前目录/%s" % CONFIG_FILE_NAME)
         sys.exit()
     conf[repositoryType]["url"] = confUrl
+    conf[repositoryType]["maxThread"] = safeReadConfig(config,"npm","maxThread") or "10"
     return True
+    
 '''
 获取配置
 '''
@@ -383,6 +419,7 @@ def getConfig(str):
         return conf[repositoryType][str]
     except Exception as e:
         return ''
+
 '''
 控制台输出，处理编码问题，
 涉及到中文的输出可以调用

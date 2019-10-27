@@ -1,0 +1,1 @@
+ mvn dependency:copy-dependencies -Dmdep.copyPom=true -DoutputDirectory=libs -Dmdep.useRepositoryLayout=true  -DincludeScope=compile 
